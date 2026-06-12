@@ -437,6 +437,40 @@ io.on('connection', (socket) => {
     emitAll(state);
   });
 
+  socket.on('set_chips', ({ roomId, playerId, amount }) => {
+    const state = rooms.get(roomId);
+    if (!state || state.adminId !== socket.id) return;
+    const p = state.players.find(pl => pl.playerId === playerId);
+    if (!p) return;
+    p.stack = Math.max(0, Number(amount) || 0);
+    state.log.push(`${p.name} fiches → ${p.stack} (admin)`);
+    emitAll(state);
+  });
+
+  socket.on('undo_fold', ({ roomId, playerId }) => {
+    const state = rooms.get(roomId);
+    if (!state || state.adminId !== socket.id) return;
+    if (state.phase === 'waiting' || state.phase === 'showdown') return;
+
+    const idx = state.players.findIndex(p => p.playerId === playerId);
+    if (idx === -1) return;
+    const player = state.players[idx];
+    if (!player.folded || player.eliminated) return;
+
+    player.folded = false;
+    player.disconnected = false;
+
+    if (!player.allIn && player.stack > 0 && !state.needToAct.includes(idx)) {
+      state.needToAct.push(idx);
+    }
+    if (state.currentPlayerIndex === -1 && state.needToAct.length > 0) {
+      state.currentPlayerIndex = state.needToAct[0];
+    }
+
+    state.log.push(`${player.name} rimesso al tavolo (admin)`);
+    emitAll(state);
+  });
+
   socket.on('kick_player', ({ roomId, playerId }) => {
     const state = rooms.get(roomId);
     if (!state || state.adminId !== socket.id) return;
