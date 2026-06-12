@@ -395,9 +395,9 @@ io.on('connection', (socket) => {
     const state = rooms.get(roomId);
     if (!state || state.adminId !== socket.id) return;
 
-    // Eliminate players with 0 chips
+    // Eliminate players with 0 chips (admin is never eliminated)
     state.players.forEach(p => {
-      if (!p.eliminated && p.stack === 0) {
+      if (!p.eliminated && !p.isAdmin && p.stack === 0) {
         p.eliminated = true;
         state.log.push(`${p.name} è eliminato (0 fiches)`);
       }
@@ -443,6 +443,13 @@ io.on('connection', (socket) => {
     if (state.phase !== 'waiting') { socket.emit('error_msg', 'Rimuovi giocatori solo in lobby'); return; }
     state.players = state.players.filter(p => p.playerId !== playerId);
     emitAll(state);
+  });
+
+  socket.on('destroy_room', ({ roomId }) => {
+    const state = rooms.get(roomId);
+    if (!state || state.adminId !== socket.id) return;
+    io.to(roomId).emit('room_destroyed');
+    rooms.delete(roomId);
   });
 
   socket.on('disconnect', () => {
