@@ -5,9 +5,7 @@ const crypto = require('crypto');
 
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: { origin: '*' }
-});
+const io = new Server(httpServer, { cors: { origin: '*' } });
 
 const rooms = new Map();
 
@@ -15,12 +13,31 @@ function generateRoomId() {
   return crypto.randomBytes(2).toString('hex').toUpperCase();
 }
 
-function activePlayers(state) {
-  return state.players.filter(p => !p.folded);
+function generatePlayerId() {
+  return crypto.randomUUID();
 }
 
-function actingPlayers(state) {
-  return state.players.filter(p => !p.folded && !p.allIn && !p.disconnected);
+function generatePin() {
+  return Math.floor(1000 + Math.random() * 9000).toString();
+}
+
+// ─── Game logic helpers ───────────────────────────────────────────────────────
+
+function isOut(p) {
+  return p.eliminated || p.disconnected;
+}
+
+function activePlayers(state) {
+  return state.players.filter(p => !p.folded && !p.eliminated);
+}
+
+function nextNonEliminated(state, fromIndex) {
+  const n = state.players.length;
+  for (let i = 1; i <= n; i++) {
+    const idx = (fromIndex + i) % n;
+    if (!state.players[idx].eliminated) return idx;
+  }
+  return fromIndex;
 }
 
 function nextActingIndex(state, fromIndex) {
@@ -33,18 +50,14 @@ function nextActingIndex(state, fromIndex) {
 }
 
 function collectBets(state) {
-  state.players.forEach(p => {
-    state.pot += p.bet;
-    p.bet = 0;
-  });
+  state.players.forEach(p => { state.pot += p.bet; p.bet = 0; });
   state.currentBet = 0;
 }
 
 function checkRoundComplete(state) {
-  // Remove from needToAct anyone folded or all-in
   state.needToAct = state.needToAct.filter(i => {
     const p = state.players[i];
-    return p && !p.folded && !p.allIn && !p.disconnected;
+    return p && !p.folded && !p.allIn && !p.eliminated && !p.disconnected;
   });
 
   const alive = activePlayers(state);
@@ -67,55 +80,62 @@ function checkRoundComplete(state) {
     return;
   }
 
-  // Advance to next player who needs to act
   const next = nextActingIndex(state, state.currentPlayerIndex);
   state.currentPlayerIndex = next !== -1 ? next : -1;
 }
 
 function startHand(state) {
-  const n = state.players.length;
+  const activeSeatCount = state.players.filter(p => !p.eliminated).length;
+  if (activeSeatCount < 2) return;
+
   state.handNumber++;
   state.pot = 0;
   state.phase = 'preflop';
   state.log = [`--- Mano #${state.handNumber} ---`];
 
   state.players.forEach(p => {
-    p.folded = false;
-    p.allIn = false;
-    p.bet = 0;
+    if (p.eliminated) {
+      p.folded = true;
+    } else {
+      p.folded = false;
+      p.allIn = false;
+      p.bet = 0;
+    }
   });
 
-  state.dealerIndex = (state.dealerIndex + 1) % n;
+  state.dealerIndex = nextNonEliminated(state, state.dealerIndex);
   state.log.push(`Dealer: ${state.players[state.dealerIndex].name}`);
 
-  const sbIdx = (state.dealerIndex + 1) % n;
-  const bbIdx = (state.dealerIndex + 2) % n;
+  // Find SB and BB skipping eliminated players
+  const sbIdx = nextNonEliminated(state, state.dealerIndex);
+  const bbIdx = nextNonEliminated(state, sbIdx);
 
   const sb = state.players[sbIdx];
   const bb = state.players[bbIdx];
 
   const sbAmt = Math.min(state.smallBlind, sb.stack);
-  sb.stack -= sbAmt;
-  sb.bet = sbAmt;
+  sb.stack -= sbAmt; sb.bet = sbAmt;
   if (sb.stack === 0) sb.allIn = true;
 
   const bbAmt = Math.min(state.bigBlind, bb.stack);
-  bb.stack -= bbAmt;
-  bb.bet = bbAmt;
+  bb.stack -= bbAmt; bb.bet = bbAmt;
   if (bb.stack === 0) bb.allIn = true;
 
   state.currentBet = bbAmt;
   state.log.push(`${sb.name} posta SB ${sbAmt}`);
   state.log.push(`${bb.name} posta BB ${bbAmt}`);
 
-  // needToAct: everyone (including BB for their option)
   state.needToAct = state.players
     .map((p, i) => ({ p, i }))
-    .filter(({ p }) => !p.folded && !p.allIn && !p.disconnected)
+    .filter(({ p }) => !p.folded && !p.allIn && !p.eliminated && !p.disconnected)
     .map(({ i }) => i);
 
-  // UTG acts first (or dealer in heads-up)
-  const utgIdx = n === 2 ? state.dealerIndex : (bbIdx + 1) % n;
+  const n = state.players.length;
+  const activeSeatCount2 = state.players.filter(p => !p.eliminated).length;
+  const utgIdx = activeSeatCount2 === 2
+    ? state.dealerIndex
+    : nextNonEliminated(state, bbIdx);
+
   state.currentPlayerIndex = state.needToAct.includes(utgIdx)
     ? utgIdx
     : nextActingIndex(state, bbIdx);
@@ -131,25 +151,18 @@ function advanceStreet(state) {
   state.phase = order[idx + 1];
   state.log.push(`--- ${state.phase.toUpperCase()} ---`);
 
-  if (state.phase === 'showdown') {
-    state.currentPlayerIndex = -1;
-    return;
-  }
+  if (state.phase === 'showdown') { state.currentPlayerIndex = -1; return; }
 
   state.players.forEach(p => { p.bet = 0; });
   state.currentBet = 0;
 
   state.needToAct = state.players
     .map((p, i) => ({ p, i }))
-    .filter(({ p }) => !p.folded && !p.allIn && !p.disconnected)
+    .filter(({ p }) => !p.folded && !p.allIn && !p.eliminated && !p.disconnected)
     .map(({ i }) => i);
 
-  if (state.needToAct.length === 0) {
-    state.currentPlayerIndex = -1;
-    return;
-  }
+  if (state.needToAct.length === 0) { state.currentPlayerIndex = -1; return; }
 
-  // First to act post-flop: first active player left of dealer
   const n = state.players.length;
   let first = -1;
   for (let i = 1; i <= n; i++) {
@@ -164,20 +177,31 @@ function emitAll(state) {
   if (!sockets) return;
   for (const sid of sockets) {
     const s = io.sockets.sockets.get(sid);
-    if (s) s.emit('game_state', { ...state, myId: sid });
+    if (s) {
+      const player = state.players.find(p => p.id === sid);
+      s.emit('game_state', { ...state, myId: sid, myPlayerId: player?.playerId });
+    }
   }
 }
 
+// ─── Socket handlers ──────────────────────────────────────────────────────────
+
 io.on('connection', (socket) => {
+
   socket.on('create_room', ({ name }) => {
     const roomId = generateRoomId();
+    const playerId = generatePlayerId();
+    const pin = generatePin();
+
     const state = {
-      roomId,
-      adminId: socket.id,
+      roomId, adminId: socket.id,
       phase: 'waiting',
       players: [{
-        id: socket.id, name, stack: 0, bet: 0,
-        folded: false, allIn: false, disconnected: false, isAdmin: true
+        id: socket.id, playerId, pin, name,
+        stack: 0, bet: 0,
+        folded: false, allIn: false,
+        eliminated: false, disconnected: false,
+        isAdmin: true
       }],
       pot: 0, currentBet: 0, currentPlayerIndex: -1,
       dealerIndex: -1, smallBlind: 10, bigBlind: 20,
@@ -185,7 +209,7 @@ io.on('connection', (socket) => {
     };
     rooms.set(roomId, state);
     socket.join(roomId);
-    socket.emit('room_created', { roomId });
+    socket.emit('room_created', { roomId, playerId, pin });
     emitAll(state);
   });
 
@@ -197,12 +221,43 @@ io.on('connection', (socket) => {
     if (state.players.find(p => p.name.toLowerCase() === name.toLowerCase())) {
       socket.emit('error_msg', 'Nome già in uso'); return;
     }
+
+    const playerId = generatePlayerId();
+    const pin = generatePin();
+
     state.players.push({
-      id: socket.id, name, stack: 0, bet: 0,
-      folded: false, allIn: false, disconnected: false, isAdmin: false
+      id: socket.id, playerId, pin, name,
+      stack: 0, bet: 0,
+      folded: false, allIn: false,
+      eliminated: false, disconnected: false,
+      isAdmin: false
     });
     socket.join(state.roomId);
-    socket.emit('room_joined', { roomId: state.roomId });
+    socket.emit('room_joined', { roomId: state.roomId, playerId, pin });
+    emitAll(state);
+  });
+
+  socket.on('rejoin_room', ({ roomId, playerId, pin }) => {
+    const state = rooms.get(roomId?.toUpperCase?.().trim());
+    if (!state) { socket.emit('rejoin_failed', 'Stanza non trovata o scaduta'); return; }
+
+    const player = state.players.find(p => p.playerId === playerId && p.pin === pin);
+    if (!player) { socket.emit('rejoin_failed', 'Credenziali non valide'); return; }
+
+    // Remove old socket from room if different
+    if (player.id !== socket.id) {
+      const oldSocket = io.sockets.sockets.get(player.id);
+      if (oldSocket) oldSocket.leave(state.roomId);
+    }
+
+    player.id = socket.id;
+    player.disconnected = false;
+
+    // If player was admin, restore admin
+    if (player.isAdmin) state.adminId = socket.id;
+
+    socket.join(state.roomId);
+    socket.emit('rejoin_success', { roomId: state.roomId, playerId: player.playerId });
     emitAll(state);
   });
 
@@ -214,9 +269,19 @@ io.on('connection', (socket) => {
     state.smallBlind = Math.max(1, Number(smallBlind) || 10);
     state.bigBlind = Math.max(2, Number(bigBlind) || 20);
     const stack = Math.max(1, Number(startingStack) || 1000);
-    state.players.forEach(p => { p.stack = stack; });
+    state.players.forEach(p => { p.stack = stack; p.eliminated = false; });
     state.dealerIndex = state.players.length - 1;
     startHand(state);
+    emitAll(state);
+  });
+
+  socket.on('reorder_seats', ({ roomId, fromIndex, toIndex }) => {
+    const state = rooms.get(roomId);
+    if (!state || state.adminId !== socket.id) return;
+    if (state.phase !== 'waiting') { socket.emit('error_msg', 'Puoi riordinare solo in lobby'); return; }
+    const players = state.players;
+    const [moved] = players.splice(fromIndex, 1);
+    players.splice(toIndex, 0, moved);
     emitAll(state);
   });
 
@@ -240,17 +305,15 @@ io.on('connection', (socket) => {
 
       case 'check':
         if (player.bet < state.currentBet) {
-          socket.emit('error_msg', 'Non puoi checkare: devi chiamare o rilanciare');
-          state.needToAct.push(playerIdx);
-          return;
+          socket.emit('error_msg', 'Non puoi checkare: chiama o rilancia');
+          state.needToAct.push(playerIdx); return;
         }
         state.log.push(`${player.name} checka`);
         break;
 
       case 'call': {
         const toCall = Math.min(state.currentBet - player.bet, player.stack);
-        player.stack -= toCall;
-        player.bet += toCall;
+        player.stack -= toCall; player.bet += toCall;
         if (player.stack === 0) player.allIn = true;
         state.log.push(`${player.name} chiama ${toCall}${player.allIn ? ' (all-in)' : ''}`);
         break;
@@ -261,42 +324,36 @@ io.on('connection', (socket) => {
         const minRaise = state.currentBet + state.bigBlind;
         if (raiseTo < minRaise && raiseTo < player.stack + player.bet) {
           socket.emit('error_msg', `Rilancio minimo: ${minRaise}`);
-          state.needToAct.push(playerIdx);
-          return;
+          state.needToAct.push(playerIdx); return;
         }
         const add = Math.min(raiseTo - player.bet, player.stack);
-        player.stack -= add;
-        player.bet += add;
+        player.stack -= add; player.bet += add;
         state.currentBet = player.bet;
         if (player.stack === 0) player.allIn = true;
-        // Everyone else needs to act again
         state.needToAct = state.players
           .map((p, i) => ({ p, i }))
-          .filter(({ p, i }) => i !== playerIdx && !p.folded && !p.allIn && !p.disconnected)
+          .filter(({ p, i }) => i !== playerIdx && !p.folded && !p.allIn && !p.eliminated && !p.disconnected)
           .map(({ i }) => i);
         state.log.push(`${player.name} rilancia a ${player.bet}${player.allIn ? ' (all-in)' : ''}`);
         break;
       }
 
       case 'all_in': {
-        const allInAdd = player.stack;
-        player.stack = 0;
-        player.bet += allInAdd;
-        player.allIn = true;
+        const add = player.stack;
+        player.stack = 0; player.bet += add; player.allIn = true;
         if (player.bet > state.currentBet) {
           state.currentBet = player.bet;
           state.needToAct = state.players
             .map((p, i) => ({ p, i }))
-            .filter(({ p, i }) => i !== playerIdx && !p.folded && !p.allIn && !p.disconnected)
+            .filter(({ p, i }) => i !== playerIdx && !p.folded && !p.allIn && !p.eliminated && !p.disconnected)
             .map(({ i }) => i);
         }
-        state.log.push(`${player.name} va all-in: ${player.bet}`);
+        state.log.push(`${player.name} all-in: ${player.bet}`);
         break;
       }
 
       default:
-        state.needToAct.push(playerIdx);
-        return;
+        state.needToAct.push(playerIdx); return;
     }
 
     checkRoundComplete(state);
@@ -306,9 +363,7 @@ io.on('connection', (socket) => {
   socket.on('next_street', ({ roomId }) => {
     const state = rooms.get(roomId);
     if (!state || state.adminId !== socket.id) return;
-    if (state.currentPlayerIndex !== -1) {
-      socket.emit('error_msg', 'Aspetta che il turno finisca'); return;
-    }
+    if (state.currentPlayerIndex !== -1) { socket.emit('error_msg', 'Aspetta che il turno finisca'); return; }
     advanceStreet(state);
     emitAll(state);
   });
@@ -317,12 +372,12 @@ io.on('connection', (socket) => {
     const state = rooms.get(roomId);
     if (!state || state.adminId !== socket.id) return;
 
-    const totalPot = state.pot;
-    const share = Math.floor(totalPot / winnerIds.length);
-    const rem = totalPot % winnerIds.length;
+    const total = state.pot;
+    const share = Math.floor(total / winnerIds.length);
+    const rem = total % winnerIds.length;
 
     winnerIds.forEach((wId, i) => {
-      const w = state.players.find(p => p.id === wId);
+      const w = state.players.find(p => p.playerId === wId);
       if (w) {
         const won = share + (i === 0 ? rem : 0);
         w.stack += won;
@@ -339,17 +394,42 @@ io.on('connection', (socket) => {
   socket.on('next_hand', ({ roomId }) => {
     const state = rooms.get(roomId);
     if (!state || state.adminId !== socket.id) return;
-    // Remove players with 0 chips (unless they're the only ones)
-    const withChips = state.players.filter(p => p.stack > 0);
-    if (withChips.length >= 2) state.players = withChips;
+
+    // Eliminate players with 0 chips
+    state.players.forEach(p => {
+      if (!p.eliminated && p.stack === 0) {
+        p.eliminated = true;
+        state.log.push(`${p.name} è eliminato (0 fiches)`);
+      }
+    });
+
+    const activeSeatCount = state.players.filter(p => !p.eliminated).length;
+    if (activeSeatCount < 2) {
+      socket.emit('error_msg', 'Non ci sono abbastanza giocatori per continuare');
+      emitAll(state);
+      return;
+    }
+
     startHand(state);
+    emitAll(state);
+  });
+
+  socket.on('readmit_player', ({ roomId, playerId, stack }) => {
+    const state = rooms.get(roomId);
+    if (!state || state.adminId !== socket.id) return;
+    const p = state.players.find(pl => pl.playerId === playerId);
+    if (!p) return;
+    p.eliminated = false;
+    p.folded = false;
+    p.stack = Number(stack) || state.bigBlind * 10;
+    state.log.push(`${p.name} riammesso con ${p.stack} fiches`);
     emitAll(state);
   });
 
   socket.on('add_chips', ({ roomId, playerId, amount }) => {
     const state = rooms.get(roomId);
     if (!state || state.adminId !== socket.id) return;
-    const p = state.players.find(pl => pl.id === playerId);
+    const p = state.players.find(pl => pl.playerId === playerId);
     if (p) {
       p.stack += Number(amount);
       state.log.push(`${p.name} rebuy +${amount}`);
@@ -360,8 +440,8 @@ io.on('connection', (socket) => {
   socket.on('kick_player', ({ roomId, playerId }) => {
     const state = rooms.get(roomId);
     if (!state || state.adminId !== socket.id) return;
-    if (state.phase !== 'waiting') { socket.emit('error_msg', 'Puoi rimuovere giocatori solo in lobby'); return; }
-    state.players = state.players.filter(p => p.id !== playerId);
+    if (state.phase !== 'waiting') { socket.emit('error_msg', 'Rimuovi giocatori solo in lobby'); return; }
+    state.players = state.players.filter(p => p.playerId !== playerId);
     emitAll(state);
   });
 
@@ -370,11 +450,12 @@ io.on('connection', (socket) => {
       const idx = state.players.findIndex(p => p.id === socket.id);
       if (idx === -1) return;
       const player = state.players[idx];
+
       if (state.phase === 'waiting') {
         state.players.splice(idx, 1);
       } else {
         player.disconnected = true;
-        if (!player.folded && !player.allIn) {
+        if (!player.folded && !player.allIn && !player.eliminated) {
           player.folded = true;
           state.needToAct = state.needToAct.filter(i => i !== idx);
           if (state.currentPlayerIndex === idx) checkRoundComplete(state);
